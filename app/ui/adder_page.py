@@ -11,6 +11,7 @@ from PySide6.QtCore import Qt
 
 from ..database import Database
 from ..config import COLORS
+from .. import cgraph_compat
 from ..workers.adder_worker import AdderWorker
 from ..workers.scraper_worker import ScraperWorker
 from .widgets import text_item, make_title
@@ -45,7 +46,7 @@ class AdderPage(QWidget):
         src_row = QHBoxLayout()
         self.src_db = QRadioButton("Veritabanı")
         self.src_db.setChecked(True)
-        self.src_csv = QRadioButton("CSV Dosyası")
+        self.src_csv = QRadioButton("Dosya (CSV / Cgraph)")
         self.src_scrape = QRadioButton("Direkt Grup Tarama")
         self.src_group = QButtonGroup(self)
         for b in (self.src_db, self.src_csv, self.src_scrape):
@@ -59,7 +60,7 @@ class AdderPage(QWidget):
         form = QFormLayout()
         self.data_combo = QComboBox()
         form.addRow("Grup Datası:", self.data_combo)
-        self.csv_btn = QPushButton("CSV Dosyası Seç")
+        self.csv_btn = QPushButton("Dosya Seç (CSV / .cumemberdata / .db)")
         self.csv_btn.setObjectName("Secondary")
         self.csv_btn.clicked.connect(self.pick_csv)
         self.csv_label = QLabel("Dosya seçilmedi")
@@ -196,11 +197,51 @@ class AdderPage(QWidget):
                 item.setSelected(True)
 
     def pick_csv(self):
-        path, _ = QFileDialog.getOpenFileName(self, "CSV Seç", "", "CSV (*.csv);;Tüm Dosyalar (*)")
-        if path:
-            self.csv_members = self.db.import_members_csv(path)
-            self.csv_label.setText(f"{path.split('/')[-1]} ({len(self.csv_members)} üye)")
-            self.log(f"CSV yüklendi: {len(self.csv_members)} üye", "info")
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Veri Dosyası Seç", "",
+            "Tüm Desteklenenler (*.csv *.cumemberdata *.db);;"
+            "CSV (*.csv);;Cgraph Üye Datası (*.cumemberdata);;"
+            "Cgraph Veri Tabanı (*.db);;Tüm Dosyalar (*)"
+        )
+        if not path:
+            return
+        low = path.lower()
+        try:
+            if low.endswith(".cumemberdata"):
+                # Cgraph düz metin üye datası (Username!UserId!Category)
+                self.csv_members = cgraph_compat.import_cumemberdata(path)
+                src = "Cgraph .cumemberdata"
+            elif cgraph_compat.is_cgraph_data_db(path):
+                # Cgraph Data veritabanı (Datasets/Members) - veri seti seçtir
+                datasets = cgraph_compat.list_cgraph_datasets(path)
+                if not datasets:
+                    QMessageBox.warning(self, "Boş", "Cgraph veritabanında veri seti yok.")
+                    return
+                if len(datasets) == 1:
+                    chosen_id = datasets[0]["DatasetId"]
+                else:
+                    from PySide6.QtWidgets import QInputDialog
+                    items = [f"{d['DatasetId']}: {d['SourceGroup']} ({d['MemberCount']} üye)"
+                             for d in datasets]
+                    items.append("Tümü")
+                    choice, ok = QInputDialog.getItem(
+                        self, "Veri Seti Seç",
+                        "İçe aktarılacak Cgraph veri setini seçin:", items, 0, False
+                    )
+                    if not ok:
+                        return
+                    chosen_id = None if choice == "Tümü" else int(choice.split(":")[0])
+                self.csv_members = cgraph_compat.import_cgraph_data_db(path, chosen_id)
+                src = "Cgraph .db"
+            else:
+                # Düz CSV (Cgraph uyumlu kolonlar)
+                self.csv_members = self.db.import_members_csv(path)
+                src = "CSV"
+        except Exception as e:
+            QMessageBox.critical(self, "Hata", f"Dosya okunamadı:\n{e}")
+            return
+        self.csv_label.setText(f"{path.split('/')[-1]} ({len(self.csv_members)} üye)")
+        self.log(f"{src} yüklendi: {len(self.csv_members)} üye", "info")
 
     def _selected_accounts(self):
         ids = [self.account_list.item(i).data(Qt.UserRole)

@@ -12,6 +12,7 @@ from PySide6.QtCore import Qt
 
 from ..database import Database
 from ..config import LAST_SEEN_OPTIONS
+from .. import cgraph_compat
 from ..workers.scraper_worker import ScraperWorker
 from .widgets import text_item, make_title
 
@@ -116,9 +117,17 @@ class ScraperPage(QWidget):
         export_sel_btn = QPushButton("Seçilenleri Dışa Aktar")
         export_sel_btn.setObjectName("Secondary")
         export_sel_btn.clicked.connect(lambda: self.export_csv(only_selected=True))
+        export_cu_btn = QPushButton("Cgraph (.cumemberdata) Dışa Aktar")
+        export_cu_btn.setObjectName("Secondary")
+        export_cu_btn.clicked.connect(self.export_cumemberdata)
+        import_cg_btn = QPushButton("Cgraph Data İçe Aktar")
+        import_cg_btn.setObjectName("Secondary")
+        import_cg_btn.clicked.connect(self.import_cgraph_data)
         res_btns.addWidget(save_btn)
         res_btns.addWidget(export_btn)
         res_btns.addWidget(export_sel_btn)
+        res_btns.addWidget(export_cu_btn)
+        res_btns.addWidget(import_cg_btn)
         res_btns.addStretch()
         right.addLayout(res_btns)
         body.addLayout(right)
@@ -175,6 +184,10 @@ class ScraperPage(QWidget):
 
     def on_member(self, m):
         self.results.append(m)
+        self.on_member_display(m)
+
+    def on_member_display(self, m):
+        """Bir üyeyi yalnızca tabloya ekler (self.results'a dokunmaz)."""
         row = self.table.rowCount()
         self.table.insertRow(row)
         chk = QCheckBox()
@@ -241,3 +254,81 @@ class ScraperPage(QWidget):
             return
         n = self.db.export_members_csv(path, data)
         QMessageBox.information(self, "Dışa Aktarıldı", f"{n} üye CSV'ye aktarıldı:\n{path}")
+
+    def export_cumemberdata(self):
+        """Sonuçları Cgraph .cumemberdata formatında dışa aktarır."""
+        if not self.results:
+            QMessageBox.information(self, "Bilgi", "Dışa aktarılacak üye yok.")
+            return
+        default = f"uyeler_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.cumemberdata"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Cgraph Data Kaydet", default, "Cgraph Üye Datası (*.cumemberdata)"
+        )
+        if not path:
+            return
+        n = cgraph_compat.export_cumemberdata(path, self.results)
+        QMessageBox.information(self, "Dışa Aktarıldı",
+                               f"{n} üye Cgraph formatında aktarıldı:\n{path}")
+
+    def import_cgraph_data(self):
+        """Cgraph .cumemberdata veya Data (.db) dosyasını okuyup tabloya + DB'ye aktarır."""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Cgraph Data Seç", "",
+            "Cgraph Data (*.cumemberdata *.db);;"
+            "Cgraph Üye Datası (*.cumemberdata);;Cgraph Veri Tabanı (*.db);;Tüm Dosyalar (*)"
+        )
+        if not path:
+            return
+        try:
+            if path.lower().endswith(".cumemberdata"):
+                members = cgraph_compat.import_cumemberdata(path)
+            elif cgraph_compat.is_cgraph_data_db(path):
+                datasets = cgraph_compat.list_cgraph_datasets(path)
+                if not datasets:
+                    QMessageBox.warning(self, "Boş", "Cgraph veritabanında veri seti yok.")
+                    return
+                if len(datasets) == 1:
+                    chosen_id = datasets[0]["DatasetId"]
+                else:
+                    from PySide6.QtWidgets import QInputDialog
+                    items = [f"{d['DatasetId']}: {d['SourceGroup']} ({d['MemberCount']} üye)"
+                             for d in datasets]
+                    items.append("Tümü")
+                    choice, ok = QInputDialog.getItem(
+                        self, "Veri Seti Seç",
+                        "İçe aktarılacak Cgraph veri setini seçin:", items, 0, False
+                    )
+                    if not ok:
+                        return
+                    chosen_id = None if choice == "Tümü" else int(choice.split(":")[0])
+                members = cgraph_compat.import_cgraph_data_db(path, chosen_id)
+            else:
+                QMessageBox.warning(self, "Desteklenmeyen", "Bu dosya türü desteklenmiyor.")
+                return
+        except Exception as e:
+            QMessageBox.critical(self, "Hata", f"Dosya okunamadı:\n{e}")
+            return
+
+        if not members:
+            QMessageBox.information(self, "Bilgi", "Dosyada üye bulunamadı.")
+            return
+
+        # Tabloyu temizle ve doldur (çok büyük listelerde tablo gösterimi ilk N ile sınırlı)
+        MAX_DISPLAY = 2000
+        self.results = list(members)
+        self.table.setRowCount(0)
+        for m in members[:MAX_DISPLAY]:
+            self.on_member_display(m)
+        note = ""
+        if len(members) > MAX_DISPLAY:
+            note = f" (tabloda ilk {MAX_DISPLAY} gösteriliyor)"
+        self.progress_label.setText(f"İçe aktarıldı: {len(members)} üye{note}")
+
+        # Otomatik veritabanına kaydet
+        count = self.db.add_members_bulk(members)
+        QMessageBox.information(
+            self, "İçe Aktarıldı",
+            f"{len(members)} üye Cgraph'tan yüklendi{note}.\n"
+            f"{count} yeni üye veritabanına kaydedildi.\n"
+            "Üye Ekleme sayfasından 'Veritabanı' kaynağı ile kullanabilirsiniz."
+        )

@@ -14,6 +14,7 @@ from PySide6.QtCore import Qt
 from ..database import Database
 from ..config import SESSIONS_DIR, STATUS_UNKNOWN, STATUS_OK, STATUS_LABELS
 from ..telegram_client import TGClient, session_path
+from .. import cgraph_compat
 from ..workers.login_worker import SendCodeWorker, SignInWorker, ConnectCheckWorker
 from .widgets import status_item, text_item, make_title
 
@@ -183,16 +184,20 @@ class ImportSessionDialog(QDialog):
         self.setMinimumWidth(420)
         self.file_path = None
 
+        self.is_cgsession = False  # seçilen dosya .cgsession mı?
+
         layout = QVBoxLayout(self)
-        info = QLabel("Cgraph veya Telethon .session dosyanızı içe aktarın.\n"
-                      "API ID ve API Hash bilgilerini girmeniz gerekir.")
+        info = QLabel("Cgraph (.cgsession) veya Telethon (.session) dosyanızı içe aktarın.\n"
+                      "• .cgsession seçerseniz API ID/Hash otomatik doldurulur ve oturum "
+                      "Telethon formatına çevrilir (SMS gerekmez).\n"
+                      "• Düz .session için API ID ve API Hash girmeniz gerekir.")
         info.setObjectName("SecondaryText")
         info.setWordWrap(True)
         layout.addWidget(info)
 
         form = QFormLayout()
         self.file_label = QLabel("Dosya seçilmedi")
-        file_btn = QPushButton("Dosya Seç (.session)")
+        file_btn = QPushButton("Dosya Seç (.cgsession / .session)")
         file_btn.setObjectName("Secondary")
         file_btn.clicked.connect(self.pick_file)
         self.api_id_input = QLineEdit()
@@ -223,41 +228,89 @@ class ImportSessionDialog(QDialog):
 
     def pick_file(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "Session Dosyası Seç", "", "Session Dosyaları (*.session);;Tüm Dosyalar (*)"
+            self, "Session Dosyası Seç", "",
+            "Cgraph/Telethon Oturum (*.cgsession *.session);;"
+            "Cgraph Oturum (*.cgsession);;Telethon Oturum (*.session);;Tüm Dosyalar (*)"
         )
-        if path:
-            self.file_path = path
-            self.file_label.setText(os.path.basename(path))
+        if not path:
+            return
+        self.file_path = path
+        self.file_label.setText(os.path.basename(path))
+
+        # .cgsession ise otomatik çöz ve API bilgilerini doldur
+        self.is_cgsession = cgraph_compat.is_cgsession(path)
+        if self.is_cgsession:
+            try:
+                info = cgraph_compat.decrypt_cgsession(path)
+                self.api_id_input.setText(str(info["api_id"]))
+                self.api_hash_input.setText(info["api_hash"])
+                self.api_id_input.setEnabled(False)
+                self.api_hash_input.setEnabled(False)
+                QMessageBox.information(
+                    self, "Cgraph Oturumu Algılandı",
+                    "Cgraph .cgsession dosyası çözüldü.\n"
+                    f"Kullanıcı ID: {info.get('user_id')}\n"
+                    f"Ana DC: {info.get('main_dc')}\n\n"
+                    "API bilgileri otomatik dolduruldu. 'İçe Aktar' ile devam edin."
+                )
+            except Exception as e:
+                self.is_cgsession = False
+                self.api_id_input.setEnabled(True)
+                self.api_hash_input.setEnabled(True)
+                QMessageBox.critical(
+                    self, "Çözme Hatası",
+                    f".cgsession dosyası çözülemedi:\n{e}"
+                )
+        else:
+            self.api_id_input.setEnabled(True)
+            self.api_hash_input.setEnabled(True)
 
     def do_import(self):
         if not self.file_path:
-            QMessageBox.warning(self, "Eksik", "Lütfen bir .session dosyası seçin.")
+            QMessageBox.warning(self, "Eksik", "Lütfen bir oturum dosyası seçin.")
             return
         api_id = self.api_id_input.text().strip()
         api_hash = self.api_hash_input.text().strip()
         if not (api_id and api_hash):
             QMessageBox.warning(self, "Eksik", "API ID ve API Hash zorunludur.")
             return
+
         base = os.path.basename(self.file_path)
-        session_name = base[:-8] if base.endswith(".session") else base
+        # Uzantıyı ayıkla, oturum adını üret
+        for ext in (".cgsession", ".session"):
+            if base.lower().endswith(ext):
+                base = base[: -len(ext)]
+                break
+        session_name = base
         dest = session_path(session_name) + ".session"
+
         try:
-            if os.path.abspath(self.file_path) != os.path.abspath(dest):
-                shutil.copy2(self.file_path, dest)
+            if self.is_cgsession:
+                # Cgraph oturumunu Telethon .session dosyasına çevir
+                info = cgraph_compat.convert_cgsession_to_telethon(self.file_path, dest)
+                phone = self.phone_input.text().strip()
+            else:
+                # Düz Telethon .session -> kopyala
+                if os.path.abspath(self.file_path) != os.path.abspath(dest):
+                    shutil.copy2(self.file_path, dest)
+                phone = self.phone_input.text().strip()
         except Exception as e:
-            QMessageBox.critical(self, "Hata", f"Dosya kopyalanamadı:\n{e}")
+            QMessageBox.critical(self, "Hata", f"Oturum içe aktarılamadı:\n{e}")
             return
+
         self.db.add_account(
             session_name=session_name,
-            phone=self.phone_input.text().strip(),
+            phone=phone,
             name="",
             api_id=api_id,
             api_hash=api_hash,
             proxy_id=self.proxy_combo.currentData(),
             status=STATUS_UNKNOWN,
         )
+        extra = ("Cgraph oturumu Telethon formatına çevrildi (SMS gerekmez).\n"
+                 if self.is_cgsession else "")
         QMessageBox.information(self, "Başarılı",
-                               f"Session içe aktarıldı: {session_name}\n"
+                               f"Oturum içe aktarıldı: {session_name}\n{extra}"
                                "Doğrulamak için 'Tümünü Bağla' kullanın.")
         self.accept()
 
