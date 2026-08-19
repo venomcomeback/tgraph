@@ -339,6 +339,167 @@ def import_cgraph_data_db(path: str, dataset_id: Optional[int] = None) -> List[D
 
 
 # --------------------------------------------------------------------------- #
+#  Cgraph ".api" ayar dosyaları  (ProxySettings.api / ApiSettings.api)
+#  Her ikisi de SQLite veritabanıdır.
+# --------------------------------------------------------------------------- #
+_VALID_PROXY_TYPES = {"socks5", "socks4", "http", "https", "mtproto"}
+
+
+def parse_proxy_address(addr: str, default_type: str = "socks5") -> Optional[Dict[str, Any]]:
+    """
+    Bir proxy adresini esnek biçimde ayrıştırır. Kabul edilen biçimler:
+        host:port
+        host:port:user:pass
+        type:host:port
+        type:host:port:user:pass
+    Geçerliyse {proxy_type, host, port, username, password} döndürür; aksi halde None.
+    JSON parçaları / çöp satırlar (geçerli host:port üretmeyen) None döner.
+    """
+    if not addr:
+        return None
+    addr = addr.strip().strip('"').strip(",").strip()
+    if not addr or addr.startswith("{") or addr.startswith("["):
+        return None
+    parts = [p.strip() for p in addr.split(":") if p.strip() != ""]
+    if len(parts) < 2:
+        return None
+
+    ptype = default_type
+    host = port = None
+    username = password = ""
+
+    # İlk parça bir proxy tipi mi?
+    if parts[0].lower() in _VALID_PROXY_TYPES:
+        ptype = parts[0].lower()
+        rest = parts[1:]
+    else:
+        rest = parts
+
+    if len(rest) < 2:
+        return None
+    host = rest[0].strip()
+    port_raw = rest[1].strip()
+
+    # host geçerli mi? boşluk/çöp içermemeli, en az bir nokta veya rakam grubu
+    if not host or " " in host or not port_raw.isdigit():
+        return None
+    port = int(port_raw)
+    if not (0 < port < 65536):
+        return None
+    # host'un makul görünmesi: nokta içeren alan adı/IP veya localhost benzeri
+    if "." not in host and host.lower() != "localhost":
+        return None
+    # host içinde harf/rakam dışı tuhaf karakter olmamalı
+    import re as _re
+    if not _re.match(r"^[A-Za-z0-9_.\-]+$", host):
+        return None
+
+    if len(rest) >= 4:
+        username = rest[2].strip()
+        password = rest[3].strip()
+
+    # TGraph şeması https'i http olarak saklar
+    if ptype == "https":
+        ptype = "http"
+
+    return {
+        "proxy_type": ptype,
+        "host": host,
+        "port": port,
+        "username": username,
+        "password": password,
+    }
+
+
+def read_cgraph_proxy_api(path: str) -> List[Dict[str, Any]]:
+    """
+    Cgraph ProxySettings.api (SQLite) dosyasından proxy'leri okur.
+    Yalnızca geçerli host:port üreten satırları döndürür (çöp satırlar atlanır).
+    Dönüş öğesi: {proxy_type, host, port, username, password, is_enabled, usage_count, raw}
+    """
+    results: List[Dict[str, Any]] = []
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    except Exception:
+        try:
+            conn = sqlite3.connect(path)
+        except Exception:
+            return results
+    try:
+        try:
+            rows = conn.execute(
+                "SELECT ProxyAdress, ProxyType, IsEnabled, UsageCount FROM CGraphProxyInfos"
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return results
+        for r in rows:
+            addr = r[0] or ""
+            ptype_hint = (r[1] or "").strip().lower() or "socks5"
+            default_type = ptype_hint if ptype_hint in _VALID_PROXY_TYPES else "socks5"
+            parsed = parse_proxy_address(addr, default_type=default_type)
+            if not parsed:
+                continue
+            parsed["is_enabled"] = 1 if (r[2] in (1, "1", True)) else 0
+            try:
+                parsed["usage_count"] = int(r[3] or 0)
+            except (ValueError, TypeError):
+                parsed["usage_count"] = 0
+            parsed["raw"] = addr
+            results.append(parsed)
+    finally:
+        conn.close()
+    return results
+
+
+def read_cgraph_api_pool(path: str) -> List[Dict[str, Any]]:
+    """
+    Cgraph ApiSettings.api (SQLite) dosyasından API ID/Hash çiftlerini okur.
+    Dönüş öğesi: {api_id, api_hash, extra}
+    """
+    results: List[Dict[str, Any]] = []
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    except Exception:
+        try:
+            conn = sqlite3.connect(path)
+        except Exception:
+            return results
+    try:
+        try:
+            rows = conn.execute(
+                "SELECT ApiID, ApiHash, Extra FROM CGraphApiInfos"
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return results
+        for r in rows:
+            api_id = str(r[0] or "").strip()
+            api_hash = str(r[1] or "").strip()
+            if not api_id or not api_hash:
+                continue
+            results.append({
+                "api_id": api_id,
+                "api_hash": api_hash,
+                "extra": str(r[2] or "") if r[2] is not None else "",
+            })
+    finally:
+        conn.close()
+    return results
+
+
+def api_file_tables(path: str) -> set:
+    """.api dosyasındaki tablo adlarını döndürür (algılama için)."""
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        tables = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()}
+        conn.close()
+        return tables
+    except Exception:
+        return set()
+
+
+# --------------------------------------------------------------------------- #
 #  Genel amaçlı veri dosyası okuyucu (uzantıya göre yönlendirir)
 # --------------------------------------------------------------------------- #
 def import_any_member_file(path: str) -> List[Dict[str, Any]]:

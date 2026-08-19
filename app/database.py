@@ -92,6 +92,14 @@ class Database:
                 key TEXT PRIMARY KEY,
                 value TEXT
             );
+
+            CREATE TABLE IF NOT EXISTS api_pool (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                api_id TEXT NOT NULL,
+                api_hash TEXT NOT NULL,
+                extra TEXT DEFAULT '',
+                added_date TEXT
+            );
             """
         )
         conn.commit()
@@ -333,6 +341,70 @@ class Database:
     def delete_proxy(self, proxy_id: int):
         conn = self._connect()
         conn.execute("DELETE FROM proxies WHERE id = ?", (proxy_id,))
+        conn.commit()
+        conn.close()
+
+    def proxy_exists(self, proxy_type: str, host: str, port: int) -> bool:
+        """(tip, host, port) üçlüsüne göre proxy zaten kayıtlı mı?"""
+        conn = self._connect()
+        row = conn.execute(
+            "SELECT 1 FROM proxies WHERE proxy_type = ? AND host = ? AND port = ? LIMIT 1",
+            (proxy_type, host, int(port)),
+        ).fetchone()
+        conn.close()
+        return row is not None
+
+    def add_proxy_unique(self, proxy_type: str, host: str, port: int,
+                         username: str = "", password: str = "") -> Optional[int]:
+        """Proxy'yi yalnızca (tip, host, port) daha önce yoksa ekler.
+        Eklendiyse yeni id, zaten varsa None döndürür."""
+        if self.proxy_exists(proxy_type, host, port):
+            return None
+        return self.add_proxy(proxy_type, host, port, username, password)
+
+    # ================================================================== #
+    #  API HAVUZU  (Cgraph ApiSettings.api ile uyumlu)
+    # ================================================================== #
+    def add_api_credential(self, api_id: str, api_hash: str, extra: str = "") -> Optional[int]:
+        """API ID/Hash çiftini havuza ekler (aynı çift varsa eklemez, None döner)."""
+        api_id = str(api_id or "").strip()
+        api_hash = str(api_hash or "").strip()
+        if not api_id or not api_hash:
+            return None
+        conn = self._connect()
+        exists = conn.execute(
+            "SELECT 1 FROM api_pool WHERE api_id = ? AND api_hash = ? LIMIT 1",
+            (api_id, api_hash),
+        ).fetchone()
+        if exists:
+            conn.close()
+            return None
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO api_pool(api_id, api_hash, extra, added_date) VALUES (?,?,?,?)",
+            (api_id, api_hash, extra or "", _now()),
+        )
+        conn.commit()
+        rid = cur.lastrowid
+        conn.close()
+        return rid
+
+    def get_api_pool(self) -> List[Dict[str, Any]]:
+        """Havuzdaki tüm API ID/Hash çiftlerini döndürür."""
+        conn = self._connect()
+        rows = conn.execute("SELECT * FROM api_pool ORDER BY id").fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+
+    def delete_api_credential(self, cred_id: int):
+        conn = self._connect()
+        conn.execute("DELETE FROM api_pool WHERE id = ?", (cred_id,))
+        conn.commit()
+        conn.close()
+
+    def clear_api_pool(self):
+        conn = self._connect()
+        conn.execute("DELETE FROM api_pool")
         conn.commit()
         conn.close()
 

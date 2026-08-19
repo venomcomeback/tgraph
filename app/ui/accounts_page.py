@@ -7,7 +7,7 @@ import shutil
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QTableWidget, QTableWidgetItem,
     QHeaderView, QDialog, QLineEdit, QComboBox, QFormLayout, QLabel, QMessageBox,
-    QFileDialog, QCheckBox, QAbstractItemView,
+    QFileDialog, QCheckBox, QAbstractItemView, QPlainTextEdit, QListWidget,
 )
 from PySide6.QtCore import Qt
 
@@ -15,7 +15,10 @@ from ..database import Database
 from ..config import SESSIONS_DIR, STATUS_UNKNOWN, STATUS_OK, STATUS_LABELS
 from ..telegram_client import TGClient, session_path
 from .. import cgraph_compat
-from ..workers.login_worker import SendCodeWorker, SignInWorker, ConnectCheckWorker
+from .. import bulk_utils
+from ..workers.login_worker import (
+    SendCodeWorker, SignInWorker, ConnectCheckWorker, BulkImportSessionsWorker,
+)
 from .widgets import status_item, text_item, make_title
 
 
@@ -315,6 +318,379 @@ class ImportSessionDialog(QDialog):
         self.accept()
 
 
+class BulkSessionImportDialog(QDialog):
+    """Bir klasördeki tüm .cgsession / .session dosyalarını toplu içe aktarır."""
+
+    def __init__(self, db: Database, parent=None):
+        super().__init__(parent)
+        self.db = db
+        self.setWindowTitle("Toplu Session Yükle")
+        self.setMinimumWidth(560)
+        self.setMinimumHeight(440)
+        self.folder = None
+        self.worker = None
+
+        layout = QVBoxLayout(self)
+        info = QLabel(
+            "Bir klasör seçin. Klasör (ve bir alt klasör seviyesi) içindeki tüm "
+            ".cgsession ve .session dosyaları taranır.\n"
+            "• .cgsession dosyaları otomatik Telethon formatına çevrilir (API bilgileri içinden okunur).\n"
+            "• Düz .session dosyaları için API bilgisi aynı klasördeki .txt dosyasından "
+            "(telefon eşlemesiyle) veya aşağıdaki varsayılan API ID/Hash'ten alınır."
+        )
+        info.setObjectName("SecondaryText")
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        form = QFormLayout()
+        self.folder_label = QLabel("Klasör seçilmedi")
+        folder_btn = QPushButton("Klasör Seç")
+        folder_btn.setObjectName("Secondary")
+        folder_btn.clicked.connect(self.pick_folder)
+        self.def_api_id = QLineEdit()
+        self.def_api_id.setPlaceholderText("Opsiyonel (düz .session için)")
+        self.def_api_hash = QLineEdit()
+        self.def_api_hash.setPlaceholderText("Opsiyonel (düz .session için)")
+        form.addRow(folder_btn, self.folder_label)
+        form.addRow("Varsayılan API ID:", self.def_api_id)
+        form.addRow("Varsayılan API Hash:", self.def_api_hash)
+        layout.addLayout(form)
+
+        self.log = QPlainTextEdit()
+        self.log.setReadOnly(True)
+        self.log.setPlaceholderText("İşlem günlüğü burada görünecek...")
+        layout.addWidget(self.log)
+
+        btns = QHBoxLayout()
+        self.start_btn = QPushButton("İçe Aktarmayı Başlat")
+        self.start_btn.clicked.connect(self.start_import)
+        self.start_btn.setEnabled(False)
+        self.close_btn = QPushButton("Kapat")
+        self.close_btn.setObjectName("Secondary")
+        self.close_btn.clicked.connect(self.reject)
+        btns.addWidget(self.close_btn)
+        btns.addWidget(self.start_btn)
+        layout.addLayout(btns)
+
+    def pick_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "Session Klasörü Seç", "")
+        if not folder:
+            return
+        self.folder = folder
+        self.folder_label.setText(folder)
+        self.start_btn.setEnabled(True)
+
+    def _log(self, line):
+        self.log.appendPlainText(line)
+
+    def start_import(self):
+        if not self.folder:
+            QMessageBox.warning(self, "Eksik", "Lütfen bir klasör seçin.")
+            return
+        self.start_btn.setEnabled(False)
+        self.close_btn.setEnabled(False)
+        existing = [a["session_name"] for a in self.db.get_accounts()]
+        self.worker = BulkImportSessionsWorker(
+            self.db, self.folder, existing,
+            self.def_api_id.text().strip(), self.def_api_hash.text().strip(),
+        )
+        self.worker.progress.connect(self._log)
+        self.worker.finished_summary.connect(self.on_finished)
+        self.worker.start()
+
+    def on_finished(self, imported, skipped, errors):
+        self.close_btn.setEnabled(True)
+        self.close_btn.setText("Kapat ve Yenile")
+        self.imported = imported
+        QMessageBox.information(
+            self, "Toplu İçe Aktarma Tamamlandı",
+            f"{imported} içe aktarıldı, {skipped} atlandı, {errors} hata."
+        )
+
+
+class BulkPhoneLoginDialog(QDialog):
+    """TXT dosyasındaki numaralarla sırayla (kod girişi ile) giriş yapar."""
+
+    def __init__(self, db: Database, parent=None):
+        super().__init__(parent)
+        self.db = db
+        self.setWindowTitle("TXT'den Numaralarla Giriş")
+        self.setMinimumWidth(600)
+        self.setMinimumHeight(560)
+
+        self.records = []          # parse edilmiş {phone, api_id, api_hash}
+        self.index = -1            # işlenmekte olan numara indeksi
+        self.tg_client = None
+        self.phone_code_hash = None
+        self.success_count = 0
+        self.fail_count = 0
+        self.send_worker = None
+        self.signin_worker = None
+
+        layout = QVBoxLayout(self)
+        info = QLabel(
+            "Bir .txt dosyası seçin. Her satır: telefon | telefon:api_id:api_hash | "
+            "api_id:api_hash:telefon (ayraç otomatik algılanır).\n"
+            "Yalnız telefon içeren satırlar için aşağıdaki Varsayılan API ID/Hash kullanılır.\n"
+            "Giriş sırasında Telegram'ın gönderdiği kodu her numara için elle girmeniz gerekir."
+        )
+        info.setObjectName("SecondaryText")
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        form = QFormLayout()
+        self.file_label = QLabel("Dosya seçilmedi")
+        file_btn = QPushButton("TXT Dosyası Seç")
+        file_btn.setObjectName("Secondary")
+        file_btn.clicked.connect(self.pick_file)
+        self.def_api_id = QLineEdit()
+        self.def_api_id.setPlaceholderText("Yalnız telefonlu satırlar için gerekli")
+        self.def_api_hash = QLineEdit()
+        self.def_api_hash.setPlaceholderText("Yalnız telefonlu satırlar için gerekli")
+        self.proxy_combo = QComboBox()
+        self.proxy_combo.addItem("Proxy Yok", None)
+        for p in self.db.get_proxies():
+            self.proxy_combo.addItem(f"{p['proxy_type']}://{p['host']}:{p['port']}", p["id"])
+        form.addRow(file_btn, self.file_label)
+        form.addRow("Varsayılan API ID:", self.def_api_id)
+        form.addRow("Varsayılan API Hash:", self.def_api_hash)
+        form.addRow("Proxy:", self.proxy_combo)
+        layout.addLayout(form)
+
+        self.count_label = QLabel("Numara: 0")
+        self.count_label.setObjectName("SecondaryText")
+        layout.addWidget(self.count_label)
+
+        self.num_list = QListWidget()
+        self.num_list.setMaximumHeight(120)
+        layout.addWidget(self.num_list)
+
+        # Kod + 2FA giriş alanı (başta gizli)
+        code_form = QFormLayout()
+        self.code_input = QLineEdit()
+        self.code_input.setPlaceholderText("Telegram'dan gelen kod")
+        self.code_label = QLabel("Kod:")
+        self.pass_input = QLineEdit()
+        self.pass_input.setEchoMode(QLineEdit.Password)
+        self.pass_input.setPlaceholderText("2FA şifresi (gerekiyorsa)")
+        self.pass_label = QLabel("2FA Şifresi:")
+        code_form.addRow(self.code_label, self.code_input)
+        code_form.addRow(self.pass_label, self.pass_input)
+        layout.addLayout(code_form)
+        self._set_code_visible(False)
+
+        self.status_label = QLabel("")
+        self.status_label.setObjectName("SecondaryText")
+        self.status_label.setWordWrap(True)
+        layout.addWidget(self.status_label)
+
+        self.log = QPlainTextEdit()
+        self.log.setReadOnly(True)
+        self.log.setMaximumHeight(140)
+        layout.addWidget(self.log)
+
+        btns = QHBoxLayout()
+        self.start_btn = QPushButton("Girişi Başlat")
+        self.start_btn.clicked.connect(self.start_flow)
+        self.start_btn.setEnabled(False)
+        self.confirm_btn = QPushButton("Kodu Onayla / Sonraki")
+        self.confirm_btn.clicked.connect(self.confirm_code)
+        self.confirm_btn.setVisible(False)
+        self.skip_btn = QPushButton("Bu Numarayı Atla")
+        self.skip_btn.setObjectName("Secondary")
+        self.skip_btn.clicked.connect(self.skip_current)
+        self.skip_btn.setVisible(False)
+        self.close_btn = QPushButton("Kapat")
+        self.close_btn.setObjectName("Secondary")
+        self.close_btn.clicked.connect(self.reject)
+        btns.addWidget(self.close_btn)
+        btns.addWidget(self.skip_btn)
+        btns.addWidget(self.start_btn)
+        btns.addWidget(self.confirm_btn)
+        layout.addLayout(btns)
+
+    # ------------------------------------------------------------------ #
+    def _set_code_visible(self, visible):
+        for w in (self.code_label, self.code_input, self.pass_label, self.pass_input):
+            w.setVisible(visible)
+
+    def _log(self, line):
+        self.log.appendPlainText(line)
+
+    def _proxy(self):
+        pid = self.proxy_combo.currentData()
+        return self.db.get_proxy(pid) if pid else None
+
+    def pick_file(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Numara Listesi Seç", "", "Metin Dosyası (*.txt);;Tüm Dosyalar (*)"
+        )
+        if not path:
+            return
+        self.file_label.setText(os.path.basename(path))
+        try:
+            self.records = bulk_utils.parse_credentials_txt(path)
+        except Exception as e:
+            QMessageBox.critical(self, "Hata", f"Dosya okunamadı:\n{e}")
+            return
+        self.num_list.clear()
+        for rec in self.records:
+            cred = "API: dosyadan" if (rec.get("api_id") and rec.get("api_hash")) else "API: varsayılan gerekli"
+            self.num_list.addItem(f"{rec['phone']}   ({cred})")
+        self.count_label.setText(f"Numara: {len(self.records)}")
+        self.start_btn.setEnabled(len(self.records) > 0)
+
+    def start_flow(self):
+        if not self.records:
+            QMessageBox.warning(self, "Eksik", "Lütfen numara içeren bir .txt seçin.")
+            return
+        self.start_btn.setEnabled(False)
+        self.close_btn.setEnabled(False)
+        self.index = -1
+        self._next_number()
+
+    def _resolve_creds(self, rec):
+        api_id = rec.get("api_id") or self.def_api_id.text().strip()
+        api_hash = rec.get("api_hash") or self.def_api_hash.text().strip()
+        return api_id, api_hash
+
+    def _next_number(self):
+        # Bir önceki istemciyi kapat
+        self._disconnect_client()
+        self.index += 1
+        self._set_code_visible(False)
+        self.confirm_btn.setVisible(False)
+        self.skip_btn.setVisible(False)
+        self.code_input.clear()
+        self.pass_input.clear()
+
+        if self.index >= len(self.records):
+            self._finish()
+            return
+
+        rec = self.records[self.index]
+        self.num_list.setCurrentRow(self.index)
+        phone = rec["phone"]
+        api_id, api_hash = self._resolve_creds(rec)
+        self.status_label.setText(f"[{self.index + 1}/{len(self.records)}] {phone} — kod gönderiliyor...")
+
+        if not (api_id and api_hash):
+            self._log(f"❌ {phone}: API ID/Hash yok (Varsayılan alanları doldurun) — atlandı.")
+            self.fail_count += 1
+            self._next_number()
+            return
+
+        self.cur_phone = phone
+        self.cur_api_id = api_id
+        self.cur_api_hash = api_hash
+        self.cur_session = bulk_utils.phone_key(phone) or phone.replace("+", "")
+
+        self._log(f"📨 {phone}: kod gönderiliyor...")
+        self.send_worker = SendCodeWorker(
+            self.cur_session, api_id, api_hash, phone, self._proxy()
+        )
+        self.send_worker.code_sent.connect(self.on_code_sent)
+        self.send_worker.error.connect(self.on_send_error)
+        self.send_worker.start()
+
+    def on_code_sent(self, phone_code_hash):
+        self.phone_code_hash = phone_code_hash
+        self.tg_client = self.send_worker.client
+        self._set_code_visible(True)
+        self.confirm_btn.setVisible(True)
+        self.confirm_btn.setEnabled(True)
+        self.skip_btn.setVisible(True)
+        self.status_label.setText(
+            f"[{self.index + 1}/{len(self.records)}] {self.cur_phone} — kod bekleniyor. "
+            "Kodu girin (2FA varsa şifreyi de) ve onaylayın."
+        )
+        self._log(f"⏳ {self.cur_phone}: kod bekleniyor...")
+
+    def on_send_error(self, msg):
+        self._log(f"❌ {self.cur_phone}: kod gönderilemedi — {msg}")
+        self.fail_count += 1
+        self._next_number()
+
+    def confirm_code(self):
+        code = self.code_input.text().strip()
+        password = self.pass_input.text().strip()
+        if not code:
+            QMessageBox.warning(self, "Eksik", "Doğrulama kodunu girin.")
+            return
+        self.confirm_btn.setEnabled(False)
+        self.status_label.setText(f"{self.cur_phone} — giriş yapılıyor...")
+        self.signin_worker = SignInWorker(
+            self.tg_client, self.cur_phone, code, self.phone_code_hash, password
+        )
+        self.signin_worker.success.connect(self.on_signin_success)
+        self.signin_worker.need_password.connect(self.on_need_password)
+        self.signin_worker.error.connect(self.on_signin_error)
+        self.signin_worker.start()
+
+    def on_need_password(self):
+        self.confirm_btn.setEnabled(True)
+        self.status_label.setText(f"{self.cur_phone} — 2FA gerekli. Şifreyi girip tekrar onaylayın.")
+        self._log(f"🔐 {self.cur_phone}: 2FA gerekli.")
+
+    def on_signin_success(self, me):
+        self._disconnect_client()
+        self.db.add_account(
+            session_name=self.cur_session,
+            phone=me.get("phone", self.cur_phone),
+            name=me.get("name", ""),
+            api_id=self.cur_api_id,
+            api_hash=self.cur_api_hash,
+            proxy_id=self.proxy_combo.currentData(),
+            status=STATUS_OK,
+        )
+        self.success_count += 1
+        self._log(f"✅ {self.cur_phone}: giriş başarılı ({me.get('name') or ''}).")
+        self._next_number()
+
+    def on_signin_error(self, msg):
+        self.confirm_btn.setEnabled(True)
+        self._log(f"❌ {self.cur_phone}: giriş başarısız — {msg}")
+        self.fail_count += 1
+        self._next_number()
+
+    def skip_current(self):
+        self._log(f"⏭️ {self.cur_phone}: atlandı.")
+        self.fail_count += 1
+        self._next_number()
+
+    def _disconnect_client(self):
+        if self.tg_client:
+            try:
+                import asyncio
+                loop = asyncio.new_event_loop()
+                loop.run_until_complete(self.tg_client.disconnect())
+                loop.close()
+            except Exception:
+                pass
+            self.tg_client = None
+
+    def _finish(self):
+        self._set_code_visible(False)
+        self.confirm_btn.setVisible(False)
+        self.skip_btn.setVisible(False)
+        self.close_btn.setEnabled(True)
+        self.close_btn.setText("Kapat ve Yenile")
+        self.status_label.setText(
+            f"Tamamlandı — {self.success_count} giriş başarılı, {self.fail_count} atlandı/başarısız."
+        )
+        self._log(
+            f"🏁 Tamamlandı — {self.success_count} başarılı, {self.fail_count} atlandı/başarısız."
+        )
+        QMessageBox.information(
+            self, "Toplu Giriş Tamamlandı",
+            f"{self.success_count} giriş başarılı, {self.fail_count} atlandı/başarısız."
+        )
+
+    def reject(self):
+        self._disconnect_client()
+        super().reject()
+
+
 class AccountsPage(QWidget):
     def __init__(self, db: Database, main_window=None):
         super().__init__()
@@ -337,6 +713,12 @@ class AccountsPage(QWidget):
         import_btn = QPushButton("Session Dosyası Yükle")
         import_btn.setObjectName("Secondary")
         import_btn.clicked.connect(self.import_session)
+        bulk_session_btn = QPushButton("Toplu Session Yükle")
+        bulk_session_btn.setObjectName("Secondary")
+        bulk_session_btn.clicked.connect(self.bulk_import_sessions)
+        bulk_phone_btn = QPushButton("TXT'den Numaralarla Giriş")
+        bulk_phone_btn.setObjectName("Secondary")
+        bulk_phone_btn.clicked.connect(self.bulk_phone_login)
         del_btn = QPushButton("Seçileni Sil")
         del_btn.setObjectName("Danger")
         del_btn.clicked.connect(self.delete_selected)
@@ -345,6 +727,8 @@ class AccountsPage(QWidget):
         connect_btn.clicked.connect(self.connect_all)
         btn_row.addWidget(add_btn)
         btn_row.addWidget(import_btn)
+        btn_row.addWidget(bulk_session_btn)
+        btn_row.addWidget(bulk_phone_btn)
         btn_row.addWidget(del_btn)
         btn_row.addWidget(connect_btn)
         btn_row.addStretch()
@@ -413,6 +797,17 @@ class AccountsPage(QWidget):
         dlg = ImportSessionDialog(self.db, self)
         if dlg.exec():
             self.refresh()
+
+    def bulk_import_sessions(self):
+        dlg = BulkSessionImportDialog(self.db, self)
+        dlg.exec()
+        # İş bittikten sonra (kapatınca) tabloyu her durumda yenile
+        self.refresh()
+
+    def bulk_phone_login(self):
+        dlg = BulkPhoneLoginDialog(self.db, self)
+        dlg.exec()
+        self.refresh()
 
     def delete_selected(self):
         ids = self.selected_account_ids()

@@ -1,18 +1,21 @@
 """
 TGraph - Proxy Yönetimi Sayfası
 """
+import os
 import socket
 import datetime
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QTableWidget, QHeaderView,
     QDialog, QLineEdit, QComboBox, QFormLayout, QMessageBox, QFileDialog,
-    QAbstractItemView, QCheckBox, QSpinBox,
+    QAbstractItemView, QCheckBox, QSpinBox, QPlainTextEdit, QLabel, QProgressBar,
 )
 from PySide6.QtCore import Qt, QThread, Signal
 
 from ..database import Database
 from ..config import COLORS
+from .. import cgraph_compat
+from ..workers.proxy_worker import ProxyFetchWorker, ProxyBulkTestWorker
 from .widgets import text_item, make_title
 
 
@@ -83,12 +86,119 @@ class AddProxyDialog(QDialog):
         self.accept()
 
 
+class AutoFetchDialog(QDialog):
+    """İnternetten ücretsiz proxy indirir, test eder ve kaydeder."""
+
+    TYPE_OPTIONS = [
+        ("SOCKS5", ["socks5"]),
+        ("SOCKS4", ["socks4"]),
+        ("HTTP", ["http"]),
+        ("Hepsi", ["socks5", "socks4", "http"]),
+    ]
+
+    def __init__(self, db: Database, parent=None):
+        super().__init__(parent)
+        self.db = db
+        self.setWindowTitle("Otomatik Proxy Yükle")
+        self.setMinimumWidth(560)
+        self.setMinimumHeight(460)
+        self.worker = None
+        self.saved = 0
+
+        layout = QVBoxLayout(self)
+        info = QLabel(
+            "Proxy listeniz boş olduğundan, internetteki ücretsiz genel proxy "
+            "kaynaklarından otomatik indirme yapılır. Ücretsiz proxy'ler kararsız "
+            "olabilir; 'test et' seçeneği yalnızca çalışanları kaydeder."
+        )
+        info.setObjectName("SecondaryText")
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        form = QFormLayout()
+        self.type_combo = QComboBox()
+        for label, _ in self.TYPE_OPTIONS:
+            self.type_combo.addItem(label)
+        self.type_combo.setCurrentIndex(0)  # SOCKS5 varsayılan
+        self.count_spin = QSpinBox()
+        self.count_spin.setRange(10, 5000)
+        self.count_spin.setValue(200)
+        self.test_check = QCheckBox("İndirildikten sonra test et ve sadece çalışanları kaydet")
+        self.test_check.setChecked(True)
+        form.addRow("Proxy Tipi:", self.type_combo)
+        form.addRow("Azami Sayı:", self.count_spin)
+        form.addRow("", self.test_check)
+        layout.addLayout(form)
+
+        self.progress = QProgressBar()
+        self.progress.setVisible(False)
+        layout.addWidget(self.progress)
+
+        self.log = QPlainTextEdit()
+        self.log.setReadOnly(True)
+        self.log.setPlaceholderText("İşlem günlüğü burada görünecek...")
+        layout.addWidget(self.log)
+
+        btns = QHBoxLayout()
+        self.start_btn = QPushButton("İndir")
+        self.start_btn.setToolTip("Seçilen tipte ücretsiz proxy'leri indirip kaydeder")
+        self.start_btn.clicked.connect(self.start)
+        self.close_btn = QPushButton("Kapat")
+        self.close_btn.setObjectName("Secondary")
+        self.close_btn.clicked.connect(self.reject)
+        btns.addWidget(self.close_btn)
+        btns.addWidget(self.start_btn)
+        layout.addLayout(btns)
+
+    def _log(self, line):
+        self.log.appendPlainText(line)
+
+    def start(self):
+        types = self.TYPE_OPTIONS[self.type_combo.currentIndex()][1]
+        self.start_btn.setEnabled(False)
+        self.close_btn.setEnabled(False)
+        self.progress.setVisible(True)
+        self.progress.setRange(0, 0)  # belirsiz (indirme aşaması)
+        self.worker = ProxyFetchWorker(
+            self.db, types, self.count_spin.value(), self.test_check.isChecked()
+        )
+        self.worker.log.connect(self._log)
+        self.worker.progress.connect(self.on_progress)
+        self.worker.finished_summary.connect(self.on_finished)
+        self.worker.start()
+
+    def on_progress(self, tested, total, working):
+        self.progress.setRange(0, total)
+        self.progress.setValue(tested)
+        self.progress.setFormat(f"Test: {tested}/{total} — çalışan: {working}")
+
+    def on_finished(self, downloaded, tested, saved):
+        self.saved = saved
+        self.progress.setRange(0, 1)
+        self.progress.setValue(1)
+        self.progress.setFormat("Tamamlandı")
+        self.start_btn.setEnabled(True)
+        self.close_btn.setEnabled(True)
+        self.close_btn.setText("Kapat ve Yenile")
+        QMessageBox.information(
+            self, "Otomatik Proxy Yükleme",
+            f"{downloaded} proxy indirildi, {tested} test edildi, {saved} çalışan kaydedildi."
+        )
+
+    def reject(self):
+        if self.worker and self.worker.isRunning():
+            self.worker.stop()
+            self.worker.wait(3000)
+        super().reject()
+
+
 class ProxyPage(QWidget):
     def __init__(self, db: Database, main_window=None):
         super().__init__()
         self.db = db
         self.main_window = main_window
         self.test_worker = None
+        self.bulk_test_worker = None
         self._build()
         self.refresh()
 
@@ -104,14 +214,27 @@ class ProxyPage(QWidget):
         load_btn = QPushButton("Dosyadan Yükle")
         load_btn.setObjectName("Secondary")
         load_btn.clicked.connect(self.load_file)
+        cg_btn = QPushButton("Cgraph'tan İçe Aktar (.api)")
+        cg_btn.setObjectName("Secondary")
+        cg_btn.setToolTip("Cgraph ProxySettings.api / ApiSettings.api dosyalarından "
+                          "proxy ve API bilgilerini içe aktarır")
+        cg_btn.clicked.connect(self.import_cgraph_api)
+        auto_btn = QPushButton("Otomatik Proxy Yükle")
+        auto_btn.setObjectName("Secondary")
+        auto_btn.setToolTip("İnternetteki ücretsiz genel proxy listelerinden indirir, "
+                            "test eder ve çalışanları kaydeder")
+        auto_btn.clicked.connect(self.auto_fetch)
         del_btn = QPushButton("Seçileni Sil")
         del_btn.setObjectName("Danger")
         del_btn.clicked.connect(self.delete_selected)
         test_btn = QPushButton("Hepsini Test Et")
         test_btn.setObjectName("Success")
         test_btn.clicked.connect(self.test_all)
+        test_btn.setToolTip("Kayıtlı tüm proxy'leri hızlı TCP-connect ile test eder")
         btn_row.addWidget(add_btn)
         btn_row.addWidget(load_btn)
+        btn_row.addWidget(cg_btn)
+        btn_row.addWidget(auto_btn)
         btn_row.addWidget(del_btn)
         btn_row.addWidget(test_btn)
         btn_row.addStretch()
@@ -171,6 +294,101 @@ class ProxyPage(QWidget):
         if dlg.exec():
             self.refresh()
 
+    def import_cgraph_api(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Cgraph Ayar Dosyası Seç", "",
+            "Cgraph Ayar Dosyası (*.api);;Tüm Dosyalar (*)"
+        )
+        if not path:
+            return
+        tables = cgraph_compat.api_file_tables(path)
+        if not tables:
+            QMessageBox.critical(
+                self, "Hata",
+                "Dosya okunamadı veya geçerli bir Cgraph .api (SQLite) dosyası değil."
+            )
+            return
+
+        summary_lines = []
+
+        # --- Proxy tablosu ---
+        if "CGraphProxyInfos" in tables:
+            try:
+                proxies = cgraph_compat.read_cgraph_proxy_api(path)
+            except Exception as e:
+                proxies = []
+                summary_lines.append(f"Proxy okuma hatası: {e}")
+            imported = skipped_dup = 0
+            skipped_mtproto = 0
+            # Toplam satır sayısını da göstermek için ham sayıya bakalım
+            for p in proxies:
+                if p["proxy_type"] == "mtproto":
+                    # MTProto PySocks tuple'ına çevrilemez; yine de kaydet ama not düş
+                    pass
+                rid = self.db.add_proxy_unique(
+                    p["proxy_type"], p["host"], p["port"],
+                    p.get("username", ""), p.get("password", ""),
+                )
+                if rid is None:
+                    skipped_dup += 1
+                else:
+                    imported += 1
+                    if p["proxy_type"] == "mtproto":
+                        skipped_mtproto += 1
+            # Geçersiz (çöp) satır sayısı = toplam ham - geçerli
+            invalid = self._count_invalid_proxy_rows(path, len(proxies))
+            line = f"🌐 Proxy: {imported} içe aktarıldı, {invalid} atlandı (geçersiz)"
+            if skipped_dup:
+                line += f", {skipped_dup} zaten kayıtlı"
+            if skipped_mtproto:
+                line += f"  (⚠️ {skipped_mtproto} MTProto — Telethon PySocks ile kullanılamaz)"
+            summary_lines.append(line)
+
+        # --- API havuzu tablosu ---
+        if "CGraphApiInfos" in tables:
+            try:
+                pool = cgraph_compat.read_cgraph_api_pool(path)
+            except Exception as e:
+                pool = []
+                summary_lines.append(f"API okuma hatası: {e}")
+            api_imported = api_dup = 0
+            for a in pool:
+                rid = self.db.add_api_credential(a["api_id"], a["api_hash"], a.get("extra", ""))
+                if rid is None:
+                    api_dup += 1
+                else:
+                    api_imported += 1
+            line = f"🔑 API: {api_imported} çift içe aktarıldı"
+            if api_dup:
+                line += f", {api_dup} zaten kayıtlı"
+            summary_lines.append(line)
+
+        if not summary_lines:
+            summary_lines.append(
+                "Bu .api dosyasında tanınan tablo (CGraphProxyInfos / CGraphApiInfos) bulunamadı."
+            )
+
+        self.refresh()
+        QMessageBox.information(
+            self, "Cgraph İçe Aktarma Özeti", "\n".join(summary_lines)
+        )
+
+    def _count_invalid_proxy_rows(self, path, valid_count):
+        """Toplam ham satır - geçerli = geçersiz (çöp) satır sayısı."""
+        import sqlite3
+        try:
+            conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+            total = conn.execute("SELECT COUNT(*) FROM CGraphProxyInfos").fetchone()[0]
+            conn.close()
+            return max(0, total - valid_count)
+        except Exception:
+            return 0
+
+    def auto_fetch(self):
+        dlg = AutoFetchDialog(self.db, self)
+        dlg.exec()
+        self.refresh()
+
     def load_file(self):
         path, _ = QFileDialog.getOpenFileName(self, "Proxy Dosyası", "", "Metin (*.txt);;Tümü (*)")
         if not path:
@@ -219,15 +437,28 @@ class ProxyPage(QWidget):
             return
         if self.main_window:
             self.main_window.set_status("Proxyler test ediliyor...")
-        self.test_worker = ProxyTestWorker(proxies)
-        self.test_worker.result.connect(self.on_test_result)
-        self.test_worker.finished.connect(self.refresh)
-        self.test_worker.start()
+        self.bulk_test_worker = ProxyBulkTestWorker(proxies)
+        self.bulk_test_worker.result.connect(self.on_test_result)
+        if self.main_window:
+            self.bulk_test_worker.progress.connect(
+                lambda done, total, ok: self.main_window.set_status(
+                    f"Proxy test ediliyor: {done}/{total} ({ok} çalışıyor)"
+                )
+            )
+        self.bulk_test_worker.finished_ok.connect(self.on_bulk_test_finished)
+        self.bulk_test_worker.start()
 
     def on_test_result(self, proxy_id, working):
+        # Sonucu veritabanına yaz; UI'yi burada yenileme (test bitince toplu yenilenir)
         self.db.update_proxy(
             proxy_id,
             is_working=1 if working else 0,
             last_check=datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
         )
+
+    def on_bulk_test_finished(self, tested, working):
         self.refresh()
+        if self.main_window:
+            self.main_window.set_status(
+                f"Test tamamlandı — {tested} test edildi, {working} çalışıyor."
+            )
