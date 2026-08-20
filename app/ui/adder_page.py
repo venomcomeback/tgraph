@@ -187,14 +187,21 @@ class AdderPage(QWidget):
         for g in self.db.get_member_groups():
             members = self.db.get_members(group_source=g)
             self.data_combo.addItem(f"{g} ({len(members)})", g)
-        # Hesapları doldur
+        # Hesapları doldur — yalnızca bağlantısı başarılı (aktif) hesaplar
         self.account_list.clear()
-        for acc in self.db.get_accounts():
+        active_accounts = self.db.get_active_accounts()
+        for acc in active_accounts:
             item = QListWidgetItem(f"{acc.get('name') or acc['session_name']} ({acc.get('phone','')}) [{acc.get('status')}]")
             item.setData(Qt.UserRole, acc["id"])
             self.account_list.addItem(item)
-            if acc.get("is_active"):
-                item.setSelected(True)
+            item.setSelected(True)
+        if not active_accounts:
+            hint = QListWidgetItem(
+                "Bağlantısı başarılı hesap yok. Hesap Yönetimi'nden 'Tümünü Bağla' ile doğrulayın."
+            )
+            hint.setData(Qt.UserRole, None)
+            hint.setFlags(Qt.NoItemFlags)
+            self.account_list.addItem(hint)
 
     def pick_csv(self):
         path, _ = QFileDialog.getOpenFileName(

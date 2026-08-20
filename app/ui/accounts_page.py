@@ -732,6 +732,10 @@ class AccountsPage(QWidget):
         btn_row.addWidget(del_btn)
         btn_row.addWidget(connect_btn)
         btn_row.addStretch()
+        self.show_failed_chk = QCheckBox("Bağlantısı başarısız hesapları da göster")
+        self.show_failed_chk.setChecked(False)
+        self.show_failed_chk.toggled.connect(self.refresh)
+        btn_row.addWidget(self.show_failed_chk)
         layout.addLayout(btn_row)
 
         self.table = QTableWidget()
@@ -749,7 +753,11 @@ class AccountsPage(QWidget):
         layout.addWidget(self.table)
 
     def refresh(self):
-        accounts = self.db.get_accounts()
+        show_failed = self.show_failed_chk.isChecked() if hasattr(self, "show_failed_chk") else False
+        if show_failed:
+            accounts = self.db.get_accounts()
+        else:
+            accounts = self.db.get_active_accounts()
         self.table.setRowCount(len(accounts))
         for row, acc in enumerate(accounts):
             chk = QCheckBox()
@@ -797,12 +805,28 @@ class AccountsPage(QWidget):
         dlg = ImportSessionDialog(self.db, self)
         if dlg.exec():
             self.refresh()
+            self._verify_inactive_accounts()
 
     def bulk_import_sessions(self):
         dlg = BulkSessionImportDialog(self.db, self)
         dlg.exec()
         # İş bittikten sonra (kapatınca) tabloyu her durumda yenile
         self.refresh()
+        self._verify_inactive_accounts()
+
+    def _verify_inactive_accounts(self):
+        """İçe aktarılan (bağlantısı doğrulanmamış) oturumları otomatik doğrular.
+        Yalnızca bağlantısı başarılı olanlar (is_active=1) varsayılan listede görünür."""
+        pending = [a for a in self.db.get_accounts() if not a.get("is_active")]
+        if not pending:
+            return
+        if self.main_window:
+            self.main_window.set_status(
+                "İçe aktarılan oturumlar doğrulanıyor; yalnızca bağlantısı başarılı olanlar listede görünecek."
+            )
+        for acc in pending:
+            proxy = self.db.get_proxy(acc["proxy_id"]) if acc.get("proxy_id") else None
+            self._check_account(acc, proxy)
 
     def bulk_phone_login(self):
         dlg = BulkPhoneLoginDialog(self.db, self)

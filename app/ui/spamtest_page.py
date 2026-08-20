@@ -69,10 +69,18 @@ class SpamTestPage(QWidget):
 
     def refresh_accounts(self):
         self.account_list.clear()
-        for acc in self.db.get_accounts():
+        active_accounts = self.db.get_active_accounts()
+        for acc in active_accounts:
             item = QListWidgetItem(f"{acc.get('name') or acc['session_name']} ({acc.get('phone','')})")
             item.setData(Qt.UserRole, acc["id"])
             self.account_list.addItem(item)
+        if not active_accounts:
+            hint = QListWidgetItem(
+                "Bağlantısı başarılı hesap yok. Hesap Yönetimi'nden 'Tümünü Bağla' ile doğrulayın."
+            )
+            hint.setData(Qt.UserRole, None)
+            hint.setFlags(Qt.NoItemFlags)
+            self.account_list.addItem(hint)
 
     def _accounts_from_ids(self, ids):
         return [self.db.get_account(i) for i in ids]
@@ -87,9 +95,13 @@ class SpamTestPage(QWidget):
         self._start(self._accounts_from_ids(ids))
 
     def test_all(self):
-        accounts = self.db.get_accounts()
+        accounts = self.db.get_active_accounts()
         if not accounts:
-            QMessageBox.information(self, "Bilgi", "Kayıtlı hesap yok.")
+            QMessageBox.information(
+                self, "Hesap Yok",
+                "Bağlantısı başarılı hesap yok. Hesap Yönetimi'nden 'Tümünü Bağla' ile "
+                "hesapları doğrulayın."
+            )
             return
         self._start(accounts)
 

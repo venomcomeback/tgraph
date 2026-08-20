@@ -9,7 +9,7 @@ from typing import Optional, Dict, Any, List, Callable
 from telethon import TelegramClient, functions, errors
 from telethon.tl.types import (
     UserStatusOnline, UserStatusOffline, UserStatusRecently,
-    UserStatusLastWeek, UserStatusLastMonth, ChannelParticipantsSearch,
+    UserStatusLastWeek, UserStatusLastMonth, ChannelParticipantsSearch, User,
 )
 from telethon.tl.functions.channels import (
     GetParticipantsRequest, InviteToChannelRequest, JoinChannelRequest,
@@ -194,8 +194,17 @@ class TGClient:
                              progress_cb: Optional[Callable[[int, int], None]] = None,
                              should_stop: Optional[Callable[[], bool]] = None,
                              filters: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
-        """Grup üyelerini tarar ve filtreye uyanları döndürür."""
+        """Grup üyelerini tarar ve filtreye uyanları döndürür.
+        filters['source'] == 'active_chatters' ise son N günde sohbet edenler taranır."""
         filters = filters or {}
+        if filters.get("source") == "active_chatters":
+            return await self.scrape_active_chatters(
+                group_link,
+                days=int(filters.get("chatter_days", 30) or 30),
+                progress_cb=progress_cb,
+                should_stop=should_stop,
+                filters=filters,
+            )
         entity = await self.get_entity(group_link)
         result: List[Dict[str, Any]] = []
 
@@ -259,6 +268,79 @@ class TGClient:
                 progress_cb(collected, max(total, collected))
             if len(participants.users) < limit:
                 break
+        return result
+
+    async def scrape_active_chatters(self, group_link: str, days: int = 30,
+                                     progress_cb: Optional[Callable[[int, int], None]] = None,
+                                     should_stop: Optional[Callable[[], bool]] = None,
+                                     filters: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        """Son `days` günde grupta MESAJ ATAN benzersiz kullanıcıları tarar.
+
+        En yeni mesajdan geriye doğru ilerler; `days` gününden eski mesaja
+        ulaşınca durur. Kanal/anonim/servis mesajlarını atlar. Aynı filtreler
+        uygulanır (exclude_bots, require_phone, lang); son görülme filtresi
+        bu modda anlamsız olduğundan uygulanmaz.
+        """
+        filters = filters or {}
+        exclude_bots = filters.get("exclude_bots", False)
+        require_phone = filters.get("require_phone", False)
+        lang_filter = (filters.get("lang", "") or "").strip().lower()
+
+        entity = await self.get_entity(group_link)
+        cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=days)
+        MAX_SCAN = 50000  # sonsuz döngüye karşı sabit üst sınır
+
+        result: List[Dict[str, Any]] = []
+        seen_ids = set()
+        scanned = 0
+
+        async for message in self.client.iter_messages(entity):
+            if should_stop and should_stop():
+                break
+            scanned += 1
+            if scanned > MAX_SCAN:
+                break
+            # Tarih penceresi: bu mesajdan eskiler dışarıda
+            msg_date = getattr(message, "date", None)
+            if msg_date is not None and msg_date < cutoff:
+                break
+            # Servis mesajlarını / gönderen yoksa atla
+            sender_id = getattr(message, "sender_id", None)
+            if not sender_id or sender_id in seen_ids:
+                if progress_cb and scanned % 200 == 0:
+                    progress_cb(len(result), len(result))
+                continue
+            try:
+                sender = message.sender
+                if sender is None:
+                    sender = await self.client.get_entity(sender_id)
+            except Exception:
+                continue
+            # Yalnızca gerçek kullanıcılar (kanal/anonim gönderenleri atla)
+            if not isinstance(sender, User):
+                continue
+            seen_ids.add(sender_id)
+            # Filtreler
+            if exclude_bots and getattr(sender, "bot", False):
+                continue
+            if require_phone and not getattr(sender, "phone", None):
+                continue
+            if lang_filter and (getattr(sender, "lang_code", "") or "").lower() != lang_filter:
+                continue
+            result.append({
+                "user_id": sender.id,
+                "access_hash": getattr(sender, "access_hash", None),
+                "username": getattr(sender, "username", "") or "",
+                "first_name": getattr(sender, "first_name", "") or "",
+                "last_name": getattr(sender, "last_name", "") or "",
+                "phone": getattr(sender, "phone", "") or "",
+                "last_seen": self._last_seen_label(getattr(sender, "status", None)),
+                "lang_code": getattr(sender, "lang_code", "") or "",
+                "is_bot": 1 if getattr(sender, "bot", False) else 0,
+                "group_source": group_link,
+            })
+            if progress_cb:
+                progress_cb(len(result), len(result))
         return result
 
     # ------------------------------------------------------------------ #

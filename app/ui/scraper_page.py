@@ -43,8 +43,12 @@ class ScraperPage(QWidget):
         self.group_input = QLineEdit()
         self.group_input.setPlaceholderText("@grupadi veya https://t.me/...")
         self.account_combo = QComboBox()
+        self.source_combo = QComboBox()
+        self.source_combo.addItem("Grupta görünen üyeler", "participants")
+        self.source_combo.addItem("Son 30 günde sohbet eden üyeler", "active_chatters")
         sform.addRow("Hedef Grup:", self.group_input)
         sform.addRow("Hesap:", self.account_combo)
+        sform.addRow("Kaynak:", self.source_combo)
         left.addWidget(settings_box)
 
         filter_box = QGroupBox("Filtreler")
@@ -134,9 +138,14 @@ class ScraperPage(QWidget):
 
     def refresh_accounts(self):
         self.account_combo.clear()
-        for acc in self.db.get_accounts():
+        accounts = self.db.get_active_accounts()
+        for acc in accounts:
             label = f"{acc.get('name') or acc['session_name']} ({acc.get('phone','')})"
             self.account_combo.addItem(label, acc["id"])
+        if not accounts:
+            self.account_combo.addItem(
+                "Bağlantısı başarılı hesap yok — Hesap Yönetimi'nden doğrulayın", None
+            )
 
     def _get_filters(self):
         return {
@@ -144,6 +153,8 @@ class ScraperPage(QWidget):
             "require_phone": self.require_phone.isChecked(),
             "last_seen_days": self.last_seen_combo.currentData(),
             "lang": self.lang_input.text().strip(),
+            "source": self.source_combo.currentData(),
+            "chatter_days": 30,
         }
 
     def start_scrape(self):
@@ -153,7 +164,11 @@ class ScraperPage(QWidget):
             return
         acc_id = self.account_combo.currentData()
         if not acc_id:
-            QMessageBox.warning(self, "Eksik", "Bir hesap seçin.")
+            QMessageBox.warning(
+                self, "Hesap Yok",
+                "Bağlantısı başarılı hesap yok. Hesap Yönetimi'nden 'Tümünü Bağla' ile "
+                "hesapları doğrulayın."
+            )
             return
         account = self.db.get_account(acc_id)
         proxy = self.db.get_proxy(account["proxy_id"]) if account.get("proxy_id") else None
