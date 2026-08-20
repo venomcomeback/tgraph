@@ -1,9 +1,26 @@
+# Python
 __pycache__/
 *.pyc
-sessions/*.session
-sessions/*.session-journal
-data/*.db
+*.pyo
+.venv/
+
+# Build / dağıtım (build.bat hariç tutulmaz)
 build/
 dist/
 *.spec
-.venv/
+
+# Hassas / kullanıcı verileri
+sessions/
+data/tgraph.db
+data/*.db
+*.session
+*.session-journal
+*.cgsession
+*.cumemberdata
+
+# Abacus meta
+.abacus.donotdelete
+
+# OS
+.DS_Store
+Thumbs.db
