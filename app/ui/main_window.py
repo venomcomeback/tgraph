@@ -14,6 +14,7 @@ from .scraper_page import ScraperPage
 from .adder_page import AdderPage
 from .proxy_page import ProxyPage
 from .spamtest_page import SpamTestPage
+from .operations_page import OperationsPage
 from .settings_page import SettingsPage
 
 
@@ -59,6 +60,7 @@ class MainWindow(QMainWindow):
             ("➕  Üye Ekleme", AdderPage),
             ("🌐  Proxy Yönetimi", ProxyPage),
             ("🛡️  Spam Testi", SpamTestPage),
+            ("🛠️  Hesap İşlemleri", OperationsPage),
             ("⚙️  Ayarlar", SettingsPage),
         ]
 

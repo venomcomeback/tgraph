@@ -99,7 +99,7 @@ class AutoFetchDialog(QDialog):
     def __init__(self, db: Database, parent=None):
         super().__init__(parent)
         self.db = db
-        self.setWindowTitle("Otomatik Proxy Yükle")
+        self.setWindowTitle("Otomatik TR Proxy Yükle")
         self.setMinimumWidth(560)
         self.setMinimumHeight(460)
         self.worker = None
@@ -107,9 +107,11 @@ class AutoFetchDialog(QDialog):
 
         layout = QVBoxLayout(self)
         info = QLabel(
-            "Proxy listeniz boş olduğundan, internetteki ücretsiz genel proxy "
-            "kaynaklarından otomatik indirme yapılır. Ücretsiz proxy'ler kararsız "
-            "olabilir; 'test et' seçeneği yalnızca çalışanları kaydeder."
+            "İnternetteki ücretsiz kaynaklardan yalnızca Türkiye (TR) proxy'leri "
+            "indirilir. Ülke filtreli kaynaklar (ProxyScrape/Geonode) doğrudan TR verir; "
+            "genel kaynaklardan gelen IP'ler GeoIP ile TR olup olmadığı doğrulanır. "
+            "Ücretsiz proxy'ler kararsız olabilir; 'test et' seçeneği yalnızca "
+            "çalışanları kaydeder."
         )
         info.setObjectName("SecondaryText")
         info.setWordWrap(True)
@@ -219,11 +221,15 @@ class ProxyPage(QWidget):
         cg_btn.setToolTip("Cgraph ProxySettings.api / ApiSettings.api dosyalarından "
                           "proxy ve API bilgilerini içe aktarır")
         cg_btn.clicked.connect(self.import_cgraph_api)
-        auto_btn = QPushButton("Otomatik Proxy Yükle")
+        auto_btn = QPushButton("Otomatik TR Proxy Yükle")
         auto_btn.setObjectName("Secondary")
-        auto_btn.setToolTip("İnternetteki ücretsiz genel proxy listelerinden indirir, "
-                            "test eder ve çalışanları kaydeder")
+        auto_btn.setToolTip("İnternetteki ücretsiz kaynaklardan yalnızca Türkiye (TR) "
+                            "proxy'lerini indirir, test eder ve çalışanları kaydeder")
         auto_btn.clicked.connect(self.auto_fetch)
+        assign_btn = QPushButton("TR Proxyleri Hesaplara Ata")
+        assign_btn.setObjectName("Success")
+        assign_btn.setToolTip("Çalışan TR proxy havuzunu aktif hesaplara round-robin dağıtır")
+        assign_btn.clicked.connect(self.assign_to_accounts)
         del_btn = QPushButton("Seçileni Sil")
         del_btn.setObjectName("Danger")
         del_btn.clicked.connect(self.delete_selected)
@@ -235,6 +241,7 @@ class ProxyPage(QWidget):
         btn_row.addWidget(load_btn)
         btn_row.addWidget(cg_btn)
         btn_row.addWidget(auto_btn)
+        btn_row.addWidget(assign_btn)
         btn_row.addWidget(del_btn)
         btn_row.addWidget(test_btn)
         btn_row.addStretch()
@@ -388,6 +395,42 @@ class ProxyPage(QWidget):
         dlg = AutoFetchDialog(self.db, self)
         dlg.exec()
         self.refresh()
+
+    def assign_to_accounts(self):
+        """Çalışan TR proxy havuzunu aktif hesaplara round-robin dağıtır."""
+        accounts = self.db.get_active_accounts()
+        if not accounts:
+            QMessageBox.information(
+                self, "Bilgi", "Proxy atanacak aktif hesap bulunamadı."
+            )
+            return
+        proxies = self.db.get_proxies()
+        if not proxies:
+            QMessageBox.information(
+                self, "Bilgi",
+                "Atanacak proxy yok. Önce 'Otomatik TR Proxy Yükle' ile proxy ekleyin."
+            )
+            return
+        working = [p for p in proxies if p.get("is_working")]
+        if not working:
+            resp = QMessageBox.question(
+                self, "Çalışan proxy yok",
+                "Test edilmiş çalışan proxy bulunamadı. Tüm proxy havuzu dağıtılsın mı?\n"
+                "(Önce 'Hepsini Test Et' önerilir.)",
+                QMessageBox.Yes | QMessageBox.No,
+            )
+            if resp != QMessageBox.Yes:
+                return
+        res = self.db.assign_proxies_to_accounts(only_working=True)
+        if self.main_window:
+            self.main_window.set_status(
+                f"TR proxy ataması: {res['assigned']} hesaba atandı."
+            )
+        QMessageBox.information(
+            self, "TR Proxy Ataması",
+            f"{res['assigned']} aktif hesaba, {res['proxies']} proxy'lik havuzdan "
+            f"round-robin proxy atandı."
+        )
 
     def load_file(self):
         path, _ = QFileDialog.getOpenFileName(self, "Proxy Dosyası", "", "Metin (*.txt);;Tümü (*)")

@@ -27,7 +27,8 @@ class SpamTestWorker(QThread):
         self._stop = True
 
     def _proxy_for(self, account):
-        pid = account.get("proxy_id")
+        # Öncelik: atanmış TR proxy (assigned_proxy_id) > manuel proxy (proxy_id)
+        pid = account.get("assigned_proxy_id") or account.get("proxy_id")
         if pid and pid in self.proxies_by_id:
             return self.proxies_by_id[pid]
         return None

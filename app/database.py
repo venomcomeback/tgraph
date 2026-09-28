@@ -103,6 +103,9 @@ class Database:
             """
         )
         conn.commit()
+        # --- Geriye dönük uyumlu şema göçleri (yalnızca eksik kolon ekleme) ---
+        self._ensure_column(cur, "accounts", "assigned_proxy_id", "INTEGER")
+        conn.commit()
         # Varsayılan ayarları ekle
         for k, v in DEFAULT_SETTINGS.items():
             cur.execute(
@@ -110,6 +113,13 @@ class Database:
             )
         conn.commit()
         conn.close()
+
+    @staticmethod
+    def _ensure_column(cur, table: str, column: str, coltype: str):
+        """Tabloda kolon yoksa ekler (veri kaybı olmadan, geriye dönük uyumlu)."""
+        cols = [r["name"] for r in cur.execute(f"PRAGMA table_info({table})").fetchall()]
+        if column not in cols:
+            cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
 
     # ================================================================== #
     #  ACCOUNTS
@@ -166,6 +176,57 @@ class Database:
         conn.execute("DELETE FROM accounts WHERE id = ?", (account_id,))
         conn.commit()
         conn.close()
+
+    def get_account_proxy(self, account: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Hesabın kullanacağı proxy'yi döndürür.
+        Öncelik: atanmış proxy (assigned_proxy_id) > manuel proxy (proxy_id).
+        """
+        if not account:
+            return None
+        pid = account.get("assigned_proxy_id") or account.get("proxy_id")
+        if not pid:
+            return None
+        return self.get_proxy(pid)
+
+    def assign_proxies_to_accounts(self, account_ids: Optional[List[int]] = None,
+                                   only_working: bool = True) -> Dict[str, Any]:
+        """TR (çalışan) proxy havuzunu aktif hesaplara round-robin dağıtır.
+
+        * account_ids verilmezse tüm aktif hesaplar kullanılır.
+        * only_working=True ise yalnızca test edilip çalışan proxy'ler dağıtılır;
+          çalışan yoksa tüm proxy'lere düşülür.
+        Dönüş: {'accounts': N, 'proxies': M, 'assigned': K}
+        """
+        # Hedef hesaplar
+        if account_ids:
+            accounts = [a for a in self.get_accounts() if a["id"] in set(account_ids)]
+        else:
+            accounts = self.get_active_accounts()
+
+        # Proxy havuzu
+        proxies = self.get_proxies()
+        pool = [p for p in proxies if p.get("is_working")] if only_working else list(proxies)
+        if only_working and not pool:
+            # Çalışan proxy yoksa tüm proxy havuzuna düş
+            pool = list(proxies)
+
+        result = {"accounts": len(accounts), "proxies": len(pool), "assigned": 0}
+        if not accounts or not pool:
+            return result
+
+        conn = self._connect()
+        try:
+            for i, acc in enumerate(accounts):
+                proxy = pool[i % len(pool)]
+                conn.execute(
+                    "UPDATE accounts SET assigned_proxy_id = ? WHERE id = ?",
+                    (proxy["id"], acc["id"]),
+                )
+                result["assigned"] += 1
+            conn.commit()
+        finally:
+            conn.close()
+        return result
 
     # ================================================================== #
     #  MEMBERS

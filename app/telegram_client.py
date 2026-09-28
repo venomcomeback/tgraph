@@ -13,8 +13,13 @@ from telethon.tl.types import (
 )
 from telethon.tl.functions.channels import (
     GetParticipantsRequest, InviteToChannelRequest, JoinChannelRequest,
+    LeaveChannelRequest,
 )
-from telethon.tl.functions.messages import ImportChatInviteRequest
+from telethon.tl.functions.messages import (
+    ImportChatInviteRequest, SendReactionRequest, GetMessagesViewsRequest,
+)
+from telethon.tl.functions.account import UpdateProfileRequest
+from telethon.tl.types import ReactionEmoji, PeerChannel
 from telethon.errors import (
     FloodWaitError, UserPrivacyRestrictedError, UserNotMutualContactError,
     PeerFloodError, UserChannelsTooMuchError, ChatWriteForbiddenError,
@@ -380,6 +385,161 @@ class TGClient:
             return False, f"Geçersiz kullanıcı: {e}"
         except Exception as e:
             return False, f"Hata: {e}"
+
+    # ------------------------------------------------------------------ #
+    #  Gruptan çıkma
+    # ------------------------------------------------------------------ #
+    async def leave_group(self, link: str):
+        """Bir kanal/süpergruptan çıkar. Dönüş: (success, message)."""
+        try:
+            entity = await self.get_entity(link)
+        except Exception as e:
+            return False, f"Grup bulunamadı: {e}"
+        try:
+            await self.client(LeaveChannelRequest(entity))
+            return True, "Çıkıldı"
+        except Exception as e:
+            # Temel gruplar (chat) için delete dene
+            try:
+                await self.client.delete_dialog(entity)
+                return True, "Çıkıldı"
+            except Exception:
+                return False, f"Çıkılamadı: {e}"
+
+    # ------------------------------------------------------------------ #
+    #  Profil güncelleme
+    # ------------------------------------------------------------------ #
+    async def update_profile(self, first_name: str = None, last_name: str = None,
+                             about: str = None, photo_path: str = None):
+        """İsim / soyisim / hakkında (bio) ve isteğe bağlı profil fotoğrafı günceller."""
+        kwargs = {}
+        if first_name is not None:
+            kwargs["first_name"] = first_name
+        if last_name is not None:
+            kwargs["last_name"] = last_name
+        if about is not None:
+            kwargs["about"] = about
+        if kwargs:
+            await self.client(UpdateProfileRequest(**kwargs))
+        if photo_path and os.path.isfile(photo_path):
+            from telethon.tl.functions.photos import UploadProfilePhotoRequest
+            file = await self.client.upload_file(photo_path)
+            await self.client(UploadProfilePhotoRequest(file=file))
+        return True
+
+    # ------------------------------------------------------------------ #
+    #  Post etkileşimleri: tepki (reaction) + görüntülenme (view)
+    # ------------------------------------------------------------------ #
+    async def resolve_post(self, link: str):
+        """Gönderi linkini (peer_entity, message_id) olarak çözer.
+
+        Desteklenen: https://t.me/<kullanıcı>/<id>  ve  https://t.me/c/<iç_id>/<id>
+        """
+        link = link.strip()
+        if "t.me/" in link:
+            tail = link.split("t.me/")[-1].strip("/")
+        else:
+            tail = link.strip("/")
+        parts = [p for p in tail.split("/") if p]
+        if len(parts) >= 3 and parts[0] == "c" and parts[1].isdigit() and parts[-1].isdigit():
+            peer = PeerChannel(int(parts[1]))
+            entity = await self.client.get_entity(peer)
+            return entity, int(parts[-1])
+        if len(parts) >= 2 and parts[-1].isdigit():
+            username = parts[0].replace("@", "")
+            entity = await self.client.get_entity(username)
+            return entity, int(parts[-1])
+        raise ValueError("Geçersiz gönderi linki")
+
+    async def send_reaction(self, entity, msg_id: int, emoji: str):
+        """Bir gönderiye emoji tepkisi ekler."""
+        await self.client(SendReactionRequest(
+            peer=entity, msg_id=int(msg_id),
+            reaction=[ReactionEmoji(emoticon=emoji)],
+        ))
+        return True
+
+    async def increment_view(self, entity, msg_id: int):
+        """Bir gönderinin görüntülenme sayısını 1 artırır."""
+        await self.client(GetMessagesViewsRequest(
+            peer=entity, id=[int(msg_id)], increment=True,
+        ))
+        return True
+
+    # ------------------------------------------------------------------ #
+    #  Toplu özel mesaj
+    # ------------------------------------------------------------------ #
+    async def send_dm(self, target, text: str):
+        """Bir kullanıcıya (username/id/entity) özel mesaj gönderir.
+        Dönüş: (success, message). FloodWaitError yukarı fırlatılır."""
+        try:
+            await self.client.send_message(target, text)
+            return True, "Gönderildi"
+        except FloodWaitError:
+            raise
+        except UserPrivacyRestrictedError:
+            return False, "Gizlilik ayarları mesaja izin vermiyor"
+        except Exception as e:
+            return False, f"Hata: {e}"
+
+    # ------------------------------------------------------------------ #
+    #  Çekilişe katılma (inline butona tıklama)
+    # ------------------------------------------------------------------ #
+    async def join_giveaway(self, link: str):
+        """Çekiliş mesajındaki katılım butonuna tıklar. Dönüş: (success, message)."""
+        try:
+            entity, msg_id = await self.resolve_post(link)
+            msg = await self.client.get_messages(entity, ids=msg_id)
+        except Exception:
+            # Link doğrudan bir bota/sohbete işaret ediyor olabilir; son mesajı dene
+            try:
+                entity = await self.get_entity(link)
+                msgs = await self.client.get_messages(entity, limit=1)
+                msg = msgs[0] if msgs else None
+            except Exception as e:
+                return False, f"Çekiliş mesajı bulunamadı: {e}"
+        if not msg:
+            return False, "Çekiliş mesajı bulunamadı"
+        buttons = getattr(msg, "buttons", None)
+        if not buttons:
+            return False, "Katılım butonu yok"
+        # Katılıma benzeyen butonu ara, yoksa ilk butona tıkla
+        keywords = ("katıl", "participate", "join", "🎉", "✅", "katil")
+        try:
+            for i, row in enumerate(buttons):
+                for j, btn in enumerate(row):
+                    label = (getattr(btn, "text", "") or "").lower()
+                    if any(k in label for k in keywords):
+                        await msg.click(i, j)
+                        return True, f"Katılındı ({getattr(btn, 'text', '')})"
+            await msg.click(0)
+            return True, "Katılındı (ilk buton)"
+        except Exception as e:
+            return False, f"Tıklanamadı: {e}"
+
+    # ------------------------------------------------------------------ #
+    #  Giriş kodu izleme (Telegram servis hesabı: 777000)
+    # ------------------------------------------------------------------ #
+    async def fetch_login_codes(self, limit: int = 5):
+        """777000 (Telegram) servis hesabından son mesajları alıp giriş kodlarını
+        döndürür. Dönüş: [{'code': ..., 'date': datetime, 'text': ...}]"""
+        import re
+        results = []
+        try:
+            msgs = await self.client.get_messages(777000, limit=limit)
+        except Exception:
+            return results
+        for m in msgs:
+            text = getattr(m, "message", "") or ""
+            match = re.search(r"(\d{5,6})", text)
+            if match:
+                results.append({
+                    "code": match.group(1),
+                    "date": getattr(m, "date", None),
+                    "text": text,
+                    "msg_id": getattr(m, "id", 0),
+                })
+        return results
 
     # ------------------------------------------------------------------ #
     #  Spam testi (@SpamBot)
