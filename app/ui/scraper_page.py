@@ -6,7 +6,7 @@ import datetime
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QTableWidget, QTableWidgetItem,
     QHeaderView, QLineEdit, QComboBox, QLabel, QGroupBox, QCheckBox, QProgressBar,
-    QFileDialog, QMessageBox, QAbstractItemView, QFormLayout,
+    QFileDialog, QMessageBox, QAbstractItemView, QFormLayout, QSpinBox,
 )
 from PySide6.QtCore import Qt
 
@@ -45,11 +45,21 @@ class ScraperPage(QWidget):
         self.account_combo = QComboBox()
         self.source_combo = QComboBox()
         self.source_combo.addItem("Grupta görünen üyeler", "participants")
-        self.source_combo.addItem("Son 30 günde sohbet eden üyeler", "active_chatters")
+        self.source_combo.addItem("Son günlerde sohbet eden üyeler", "active_chatters")
+        self.source_combo.currentIndexChanged.connect(self._on_source_changed)
+        self.days_spin = QSpinBox()
+        self.days_spin.setMinimum(1)
+        self.days_spin.setMaximum(3650)
+        self.days_spin.setValue(30)
+        self.days_spin.setSuffix(" gün")
+        self.days_label = QLabel("Gün aralığı:")
         sform.addRow("Hedef Grup:", self.group_input)
         sform.addRow("Hesap:", self.account_combo)
         sform.addRow("Kaynak:", self.source_combo)
+        sform.addRow(self.days_label, self.days_spin)
         left.addWidget(settings_box)
+        # Başlangıç durumu: gün aralığı yalnızca "sohbet edenler" kaynağında görünür
+        self._on_source_changed()
 
         filter_box = QGroupBox("Filtreler")
         fl = QVBoxLayout(filter_box)
@@ -147,6 +157,13 @@ class ScraperPage(QWidget):
                 "Bağlantısı başarılı hesap yok — Hesap Yönetimi'nden doğrulayın", None
             )
 
+    def _on_source_changed(self, *args):
+        """Gün aralığı alanı yalnızca 'sohbet edenler' kaynağı seçiliyken görünür."""
+        is_chatters = self.source_combo.currentData() == "active_chatters"
+        self.days_label.setVisible(is_chatters)
+        self.days_spin.setVisible(is_chatters)
+        self.days_spin.setEnabled(is_chatters)
+
     def _get_filters(self):
         return {
             "exclude_bots": self.exclude_bots.isChecked(),
@@ -154,7 +171,7 @@ class ScraperPage(QWidget):
             "last_seen_days": self.last_seen_combo.currentData(),
             "lang": self.lang_input.text().strip(),
             "source": self.source_combo.currentData(),
-            "chatter_days": 30,
+            "chatter_days": self.days_spin.value(),
         }
 
     def start_scrape(self):
